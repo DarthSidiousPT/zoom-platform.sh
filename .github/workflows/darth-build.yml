@@ -50,7 +50,6 @@ jobs:
           name: "Darth fork build (latest main)"
           body: "Automated build of zoom-platform.sh from ${{ github.repository }}@${{ github.sha }}. Not an official ZOOM Platform release."
           allowUpdates: true
-          prerelease: true
           makeLatest: false
 
       # Permanent, never-overwritten archive of this exact build. Tagged by commit SHA
@@ -66,5 +65,4 @@ jobs:
           name: "Darth build ${{ steps.vars.outputs.sha_short }}"
           body: "Automated build of zoom-platform.sh from ${{ github.repository }}@${{ github.sha }}. Not an official ZOOM Platform release."
           allowUpdates: false
-          prerelease: true
           makeLatest: false
