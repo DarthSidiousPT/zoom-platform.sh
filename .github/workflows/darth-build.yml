@@ -1,0 +1,70 @@
+name: Build (Darth fork)
+
+# Fork-only build: produces a renamed zoom-platform-darth.sh and publishes it to a
+# rolling "darth-latest" GitHub Release on every push to this fork's main. Guarded by
+# the repository check below so that if this file is ever pulled into Zoom's official
+# repo (e.g. by accident via a future PR), it stays inert there instead of running.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.repository == 'DarthSidiousPT/zoom-platform.sh'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build
+        run: |
+          chmod +x dist.sh
+          chmod +x build.sh
+          ./dist.sh
+          cp zoom-platform.sh zoom-platform-darth.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zoom-platform-darth
+          path: zoom-platform-darth.sh
+
+      - name: Compute short commit SHA
+        id: vars
+        run: echo "sha_short=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Move rolling darth-latest tag to this commit
+        run: |
+          git tag -f darth-latest
+          git push -f origin darth-latest
+
+      - name: Publish rolling latest release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: darth-latest
+          artifacts: "zoom-platform-darth.sh"
+          name: "Darth fork build (latest main)"
+          body: "Automated build of zoom-platform.sh from ${{ github.repository }}@${{ github.sha }}. Not an official ZOOM Platform release."
+          allowUpdates: true
+          prerelease: true
+          makeLatest: false
+
+      # Permanent, never-overwritten archive of this exact build. Tagged by commit SHA
+      # rather than a version number on purpose: this fork's main can be ahead of
+      # Zoom's main (containing fixes not yet merged upstream), so reusing Zoom's
+      # version numbers here would make "vX.Y" ambiguous about which content it
+      # actually contains. A SHA can never collide with or be confused for that.
+      - name: Publish permanent per-commit release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "darth-${{ steps.vars.outputs.sha_short }}"
+          artifacts: "zoom-platform-darth.sh"
+          name: "Darth build ${{ steps.vars.outputs.sha_short }}"
+          body: "Automated build of zoom-platform.sh from ${{ github.repository }}@${{ github.sha }}. Not an official ZOOM Platform release."
+          allowUpdates: false
+          prerelease: true
+          makeLatest: false
