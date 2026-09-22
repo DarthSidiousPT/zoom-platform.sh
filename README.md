@@ -8,6 +8,9 @@
 > fork of doZennn's ZOOM-patched fork) so installers using newer Inno Setup versions
 > actually work, and fixes for DLC installers and uninstaller cleanup. This fork stays
 > current instead of waiting on upstream's release cadence.
+>
+> This is an independent, unofficial fork - it is not endorsed by, affiliated with, or
+> supported by ZOOM Platform.
 
 A tool to streamline installation, updating, and playing Windows games from [ZOOM Platform](https://www.zoom-platform.com/) on Linux using [umu](https://github.com/Open-Wine-Components/umu-launcher) and Proton.
 
