@@ -3,6 +3,10 @@ set -e
 
 cd "$(dirname "$0")"
 FINAL_FILE="zoom-platform.sh"
+# Optional: force a specific version string instead of build.sh's own auto-detection
+# (git tag at HEAD, else git-<sha>). Used by the Darth-fork CI workflow, which needs
+# an unambiguous version even when several git tags point at the same commit.
+FORCED_VERSION=$1
 
 # doZennn/innoextract (the ZOOM-patched fork this script depends on for --zoom-game-id
 # and --print-headers) hasn't cut a GitHub Release since v1.11.1 (2024-03-03), which only
@@ -22,4 +26,4 @@ tar -xzf innoextract-upx.tar.gz
 rm innoextract-upx.tar.gz
 chmod +x innoextract-upx
 
-./build.sh "src.sh" "innoextract-upx" > "$FINAL_FILE"
+./build.sh "src.sh" "innoextract-upx" "$FORCED_VERSION" > "$FINAL_FILE"
