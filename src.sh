@@ -858,24 +858,59 @@ EOL
     fi
 done
 
+# A shared prefix can hold more than one install (base game + DLC(s)), each with
+# its own $GAME_NAME_SAFE/applications dir, but they all share one $ZOOM_GUID
+# and get wiped together below. So the uninstaller must clean up every
+# applications dir ever created in this prefix, not just the one this install
+# just made. Every install writes its group name as the "IconGroup" value
+# under its own [Software\ZOOM PLATFORM\...] key in system.reg, so pull the
+# full list back out with get_prefix_reg_val (union'd with $GAME_NAME_SAFE
+# itself, since wine may not have flushed this install's own key to
+# system.reg yet).
+#
+# Filter out anything that isn't a bare directory name (empty, ".", "..", or
+# containing "/") before it's used inside rm -rf below.
+_icon_groups="$(
+    {
+        get_prefix_reg_val "$INSTALL_PATH" 'IconGroup'
+        printf '%s\n' "$GAME_NAME_SAFE"
+    } | sort -u | while IFS= read -r _g; do
+        case "$_g" in
+            "" | . | ..) continue ;;
+            */*) continue ;;
+        esac
+        printf '%s\n' "$_g"
+    done
+)"
+# Escape for embedding as a single-quoted literal inside the heredoc below
+# (group names can contain spaces, e.g. "e-Racer Track Pack DLC", and in
+# theory apostrophes).
+_icon_groups_escaped="$(printf '%s\n' "$_icon_groups" | sed "s/'/'\\\\''/g")"
+
 # Create uninstaller
 # The Desktop symlinks and Public Desktop lookup below don't exist yet at this
 # point in the script (they're created further down), so the uninstaller can't
 # just record their paths. Instead it scans the Desktop at uninstall time and
-# removes only the symlinks that point into this game's applications dir,
+# removes only the symlinks that point into a known applications dir,
 # leaving every other file on the Desktop alone.
 cat >"$INSTALL_PATH/uninstall.sh" <<EOL
 #!/bin/sh
 printf "You are about to remove %s's data and shortcuts. Are you sure you want to continue? [y/N]\n" "$GAME_NAME_SAFE"
 read in
 if [ "\$in" = "y" ] || [ "\$in" = "yes" ] || [ "\$in" = "Y" ] || [ "\$in" = "YES" ]; then
-    for _desktopfile in "$DESKTOP_DIR"/*.desktop; do
-        [ -L "\$_desktopfile" ] || continue
-        case "\$(readlink "\$_desktopfile")" in
-            "$APPLICATIONS_PATH"/*) rm -f "\$_desktopfile" ;;
-        esac
+    # Every applications-menu group name ever installed into this prefix
+    # (base game + any DLC), baked in at install time.
+    _icon_groups='$_icon_groups_escaped'
+    printf '%s\n' "\$_icon_groups" | while IFS= read -r _group; do
+        [ -n "\$_group" ] || continue
+        for _desktopfile in "$DESKTOP_DIR"/*.desktop; do
+            [ -L "\$_desktopfile" ] || continue
+            case "\$(readlink "\$_desktopfile")" in
+                "$APPLICATIONS_ROOT/\$_group"/*) rm -f "\$_desktopfile" ;;
+            esac
+        done
+        rm -rf "$APPLICATIONS_ROOT/\$_group"
     done
-    rm -rf "$APPLICATIONS_PATH"
     # Launch script symlinks in \$XDG_DATA_HOME/zoom-platform/
     rm -rf "$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID"
     rm -rf "$INSTALL_PATH"
