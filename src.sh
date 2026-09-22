@@ -707,7 +707,12 @@ umu_launch "$INPUT_INSTALLER" \
 
 # Watch the install log
 _currentfile=0
-_filecount=$(($(get_header_val 'file_count')+$(get_header_val 'icon_count')))
+# Not every installer reports every header (DLC installers in particular may
+# omit icon_count entirely rather than report 0), so default missing values
+# to 0 - otherwise $(( )) dies on an empty operand.
+_header_file_count=$(get_header_val 'file_count')
+_header_icon_count=$(get_header_val 'icon_count')
+_filecount=$(( ${_header_file_count:-0} + ${_header_icon_count:-0} ))
 _readlog=1
 while [ $_readlog -eq 1 ]; do
     sleep 0.010
