@@ -1,4 +1,14 @@
 # [zoom-platform.sh](https://zoom-platform.sh/)
+
+> **This is [DarthSidiousPT](https://github.com/DarthSidiousPT)'s fork of
+> [ZOOM-Platform/zoom-platform.sh](https://github.com/ZOOM-Platform/zoom-platform.sh)**,
+> kept up to date with fixes and installer compatibility work that hasn't landed upstream
+> yet - including building `innoextract` from
+> [DarthSidiousPT/innoextract](https://github.com/DarthSidiousPT/innoextract) (itself a
+> fork of doZennn's ZOOM-patched fork) so installers using newer Inno Setup versions
+> actually work, and fixes for DLC installers and uninstaller cleanup. This fork stays
+> current instead of waiting on upstream's release cadence.
+
 A tool to streamline installation, updating, and playing Windows games from [ZOOM Platform](https://www.zoom-platform.com/) on Linux using [umu](https://github.com/Open-Wine-Components/umu-launcher) and Proton.
 
 ## Building
