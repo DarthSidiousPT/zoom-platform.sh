@@ -1,7 +1,7 @@
 # Project conventions and tips
 
 1. Use [ShellCheck](https://www.shellcheck.net/)
-2. You need to use this fork of innoextract: https://github.com/doZennn/innoextract
+2. You need to use this fork of innoextract: https://github.com/DarthSidiousPT/innoextract (a fork of the ZOOM-patched https://github.com/doZennn/innoextract, kept current with newer Inno Setup versions). Vanilla innoextract won't work, it lacks the `--zoom-game-id` and `--print-headers` flags. Grab `innoextract.tar.gz` from its [latest release](https://github.com/DarthSidiousPT/innoextract/releases/latest).
 3. You don't need to build anything. Work on `src.sh` directly, it will load `innoextract` from the cwd.
 4. Indent with 4 spaces.
 5. Variables:
