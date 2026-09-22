@@ -16,6 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
+      - name: Install innoextract build dependencies
+        # dist.sh builds innoextract from source (see its comment for why).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ libboost-all-dev liblzma-dev pkg-config upx-ucl
+
       - name: Build
         run: |
           chmod +x dist.sh
