@@ -19,7 +19,9 @@ INNOLIC='###
 # This script uses a fork of "innoextract" licensed under the zlib/libpng license.
 #
 # Original innoextract (c) Daniel Scharrer <daniel@constexpr.org> https://constexpr.org/innoextract/
-# Fork by Jozen Blue Martinez for ZOOM Platform https://github.com/doZennn/innoextract
+# ZOOM Platform fork by Jozen Blue Martinez https://github.com/doZennn/innoextract
+# Built from DarthSidiousPT'"'"'s fork of that, kept up to date with newer Inno Setup
+# versions: https://github.com/DarthSidiousPT/innoextract
 ###'
 SCRIPT=$(printf "%s" "$SCRIPT" | awk -v r="###\n$HASHEDLIC\n###\n\n$INNOLIC" '{gsub(/#__LICENSE_HERE__/,r)}1')
 
