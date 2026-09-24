@@ -212,7 +212,20 @@ umu_launch_command() {
 umu_launch() {
     if [ "$UMU_BIN" = "FLATPAK" ]; then
         [ -z "$PROTON_VERB" ] && PROTON_VERB=waitforexitandrun
-        flatpak run --env=GAMEID="$GAMEID" --env=WINEPREFIX="$WINEPREFIX" --env=PROTON_VERB="$PROTON_VERB" org.openwinecomponents.umu.umu-launcher "$@"
+        # The Flatpak only sees the env vars passed with --env, so a caller that sets
+        # extra ones for a single call (see ensure_proton_shortcuts) opts in by listing
+        # their names in ZOOM_FORWARD_ENV. Forwarding them unconditionally would also
+        # start applying e.g. the user's own global WINEDLLOVERRIDES to every other
+        # call, which the Flatpak never saw before.
+        # The app id goes first and each --env is put in front of everything, which keeps
+        # values with spaces intact and them all before the app id, where flatpak wants them.
+        set -- org.openwinecomponents.umu.umu-launcher "$@"
+        for _fwd_name in $ZOOM_FORWARD_ENV; do
+            _fwd_val=""
+            eval "_fwd_val=\${$_fwd_name}"
+            set -- "--env=$_fwd_name=$_fwd_val" "$@"
+        done
+        flatpak run --env=GAMEID="$GAMEID" --env=WINEPREFIX="$WINEPREFIX" --env=PROTON_VERB="$PROTON_VERB" "$@"
     else
         "$UMU_BIN" "$@"
     fi
@@ -421,6 +434,210 @@ parse_lnk() {
             fi
         fi
     done
+}
+
+# Whether a shortcut is one we don't make a launcher for: the uninstaller, PDFs and
+# HTML manuals.
+# $1: exe (or document) the shortcut points to. Wine's StartupWMClass is this,
+#     lowercased; parse_lnk gives it in its original case. Lowercased here so both work.
+# $2: shortcut name (the .lnk filename without extension, same as the .desktop Name=)
+# Returns 0 if the shortcut should be skipped.
+is_skipped_shortcut() {
+    _skip_target=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    _skip_name=$2
+    case $_skip_target in
+        # Skip uninstaller and PDFs
+        "unins000.exe" | *".pdf")
+            return 0
+            ;;
+        # Skip HTML manuals
+        *".html" | *".htm")
+            case $_skip_name in
+                *"Manual"*)
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+# Print the Windows path of every shortcut (.lnk) this install created, one per line.
+# Inno logs each [Icons] entry as:
+#     <timestamp>   -- Icon entry --
+#     <timestamp>   Dest filename: C:\ProgramData\...\Start Menu\Programs\Game\Game.lnk
+# The log is recreated for every installer run, so in a prefix shared by a base game
+# and its DLC this only returns the shortcuts of the install that just ran.
+get_install_lnks() {
+    # The log has CRLF line endings (and a UTF-8 BOM on its first line, which never
+    # matters here). An "Icon entry" header arms the flag, the next "Dest filename:"
+    # is the shortcut, and any other "-- Xxx entry --" header disarms it so a File
+    # entry's "Dest filename:" is never mistaken for one.
+    awk '
+        { sub("\r$", "") }
+        /-- Icon entry --$/ { icon = 1; next }
+        /-- [A-Za-z]+ entry --$/ { icon = 0; next }
+        icon && /Dest filename: / {
+            sub(/^.*Dest filename: /, "")
+            if (tolower($0) ~ /\.lnk$/) print
+            icon = 0
+        }
+    ' "$INSTALL_PATH/drive_c/zoom_installer.log"
+}
+
+# Fallback for get_install_lnks: find this game's shortcuts on disk instead. Looks in
+# its own Start Menu folder (named after default_group_name) under both the common
+# and the per-user Start Menu. Prints Windows paths like get_install_lnks.
+# Newlines in shortcut names aren't handled (Windows doesn't allow them anyway).
+find_install_lnks() {
+    [ -n "$GAME_NAME_SAFE" ] || return 0
+    _fl_drive_c="$INSTALL_PATH/drive_c"
+    find "$_fl_drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs/$GAME_NAME_SAFE" \
+         "$_fl_drive_c"/users/*/AppData/Roaming/Microsoft/Windows/"Start Menu/Programs/$GAME_NAME_SAFE" \
+         -iname '*.lnk' 2> /dev/null | while IFS= read -r _fl_lnk; do
+        # Strip the (literal, hence quoted) prefix up to drive_c, then / -> \ (octal 134,
+        # to keep a literal backslash out of the quoting) and put C:\ back
+        _fl_win=$(printf '%s' "${_fl_lnk#"$_fl_drive_c/"}" | tr '/' '\134')
+        printf '%s\n' "C:\\$_fl_win"
+    done
+}
+
+# Shortcut name from its Windows path: the filename without ".lnk". Wine names the
+# .desktop it writes into proton_shortcuts after it, so this is also the .desktop's name.
+get_lnk_name() {
+    _gl_name=${1##*\\}
+    printf '%s' "${_gl_name%.[lL][nN][kK]}"
+}
+
+# Wait for wine to finish creating Proton's shortcuts (proton_shortcuts/*.desktop),
+# then make sure every shortcut this install created has one.
+#
+# Wine's winemenubuilder turns each .lnk the installer saves into a .desktop + icons,
+# but it's started in the background and nothing waits for it. Right after the
+# installer is killed it may still be running, or it may never have run at all: setups
+# that export WINEDLLOVERRIDES="winemenubuilder.exe=d" (Lutris-style ones do) disable it.
+# Without this step that means no launchers and no error.
+#
+# 1. Any default-verb umu launch runs "wineserver -w" first (Proton's waitforexitandrun),
+#    which waits for every process in the prefix, background winemenubuilders included.
+# 2. Shortcuts that still have no .desktop get winemenubuilder run by hand, with the
+#    winemenubuilder DLL override forced back on for that call only.
+# 3. Whatever is still missing is reported by name (not fatal, the game is installed).
+#
+# Sets SHORTCUTS_KEPT to how many shortcuts this install has that should get a launcher.
+# Output of the umu calls goes to drive_c/zoom_menubuilder.log.
+# Idea from upstream's 672c694 ("Run winemenubuilder manually").
+ensure_proton_shortcuts() {
+    _sc_log="$INSTALL_PATH/drive_c/zoom_menubuilder.log"
+    SHORTCUTS_KEPT=0
+
+    _sc_links=$(get_install_lnks)
+    [ -n "$_sc_links" ] || _sc_links=$(find_install_lnks)
+    if [ -z "$_sc_links" ]; then
+        _sc_icon_count=$(get_header_val 'icon_count')
+        [ "${_sc_icon_count:-0}" -gt 0 ] && \
+            log_error "No shortcuts were created by the installer (it defines ${_sc_icon_count}), so there are no launchers. If you deselected the shortcut options in the installer that's expected."
+    fi
+
+    # Sync point, see (1) above. Any cheap command works, hostname has no side effects.
+    # UMU_CONTAINER_NSENTER would switch umu to a verb that doesn't wait.
+    ( unset UMU_CONTAINER_NSENTER; umu_launch hostname ) >> "$_sc_log" 2>&1 < /dev/null
+
+    _sc_seen='|'
+    _sc_missing=''
+    _sc_nl='
+'
+    # Reads from a here-doc rather than a pipe so the counters survive the loop (dash
+    # runs the right side of a pipe in a subshell). The umu calls inside get </dev/null
+    # so they can't swallow the here-doc.
+    while IFS= read -r _sc_win; do
+        [ -n "$_sc_win" ] || continue
+        _sc_name=$(get_lnk_name "$_sc_win")
+
+        # The Desktop and Start Menu copies of a shortcut share one .desktop, only handle it once
+        case $_sc_seen in
+            *"|$_sc_name|"*) continue ;;
+        esac
+        _sc_seen="$_sc_seen$_sc_name|"
+
+        _sc_desktop="$PROTON_SHORTCUTS_PATH/$_sc_name.desktop"
+        if [ -f "$_sc_desktop" ]; then
+            # Wine made it. The skip rules apply to what wine recorded as the target.
+            is_skipped_shortcut "$(get_desktop_value "StartupWMClass" "$_sc_desktop")" "$_sc_name" && continue
+            SHORTCUTS_KEPT=$((SHORTCUTS_KEPT+1))
+            continue
+        fi
+
+        # No .desktop. Read the .lnk to decide whether it's one we'd skip anyway, so we
+        # don't launch umu for the uninstaller and manuals.
+        # C:\a\b.lnk -> <prefix>/drive_c/a/b.lnk. Wine matches names case-insensitively
+        # and the filesystem doesn't, so if that misses ask wine for the real path.
+        _sc_rel=${_sc_win#?:\\}
+        _sc_native="$INSTALL_PATH/drive_c/$(printf '%s' "$_sc_rel" | tr '\134' '/')" # \134 is a backslash
+        if [ ! -f "$_sc_native" ]; then
+            _sc_native=$( (PROTON_VERB=getnativepath umu_launch "$_sc_win" < /dev/null) 2> /dev/null | head -n 1)
+        fi
+        if [ ! -f "$_sc_native" ]; then
+            log_error "Can't find the shortcut file for \"$_sc_name\" ($_sc_win), so it won't get a launcher."
+            continue
+        fi
+        # LocalBasePath is the target exe; parse_lnk doubles the backslashes, so drop
+        # everything up to the last one to get the exe name. A corrupt .lnk makes
+        # parse_lnk complain and print nothing: the exe is then unknown, so it's not
+        # skipped and winemenubuilder gets to have its say (and gets reported if it fails).
+        _sc_exe=$(parse_lnk "$_sc_native" 2> /dev/null | sed -n 's/^LocalBasePath://p')
+        _sc_exe=${_sc_exe##*\\}
+        is_skipped_shortcut "$_sc_exe" "$_sc_name" && continue
+
+        SHORTCUTS_KEPT=$((SHORTCUTS_KEPT+1))
+        _sc_missing="$_sc_missing$_sc_win$_sc_nl"
+    done <<EOL
+$_sc_links
+EOL
+
+    [ -n "$_sc_missing" ] || return 0
+
+    log_info "Wine didn't create every shortcut, creating the missing ones..."
+    printf '=== winemenubuilder for shortcuts wine did not create:\n%s' "$_sc_missing" >> "$_sc_log"
+    # Proton hides wine's own messages unless PROTON_LOG is set, and then writes them to a
+    # steam-*.log of their own. Turn that on for this call only, so that when winemenubuilder
+    # fails, what it said about it ends up in our log instead of nowhere.
+    _sc_wine_log_dir="$INSTALL_PATH/drive_c/zoom_menubuilder_tmp"
+    mkdir -p "$_sc_wine_log_dir"
+    (
+        # One call for all of them. Each .lnk is its own argument, so names with spaces,
+        # quotes or non-ASCII characters need no escaping (unlike a generated .bat, which
+        # cmd would read in the OEM codepage).
+        set --
+        while IFS= read -r _sc_win; do
+            [ -n "$_sc_win" ] && set -- "$@" "$_sc_win"
+        done <<EOL
+$_sc_missing
+EOL
+        # Force the DLL back on for this call only, keeping whatever else the user set.
+        # Later entries win, so this beats a user's "winemenubuilder.exe=d". It stays
+        # inside this subshell, so no other umu call or generated launch script sees it.
+        WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}winemenubuilder.exe=b"
+        PROTON_LOG=1
+        PROTON_LOG_DIR="$_sc_wine_log_dir"
+        WINEDEBUG="err+menubuilder,warn+menubuilder"
+        export WINEDLLOVERRIDES PROTON_LOG PROTON_LOG_DIR WINEDEBUG
+        ZOOM_FORWARD_ENV="WINEDLLOVERRIDES PROTON_LOG PROTON_LOG_DIR WINEDEBUG"
+        umu_launch winemenubuilder "$@"
+    ) >> "$_sc_log" 2>&1 < /dev/null
+    # Keep just wine's winemenubuilder lines, and drop the rest of Proton's log
+    cat "$_sc_wine_log_dir"/*.log 2> /dev/null | grep -a 'menubuilder:' >> "$_sc_log"
+    rm -rf "$_sc_wine_log_dir"
+
+    # winemenubuilder exits 0 even when it fails to write an entry, so check for the files
+    while IFS= read -r _sc_win; do
+        [ -n "$_sc_win" ] || continue
+        _sc_name=$(get_lnk_name "$_sc_win")
+        [ -f "$PROTON_SHORTCUTS_PATH/$_sc_name.desktop" ] || \
+            log_error "Couldn't create a launcher for the shortcut \"$_sc_name\" ($_sc_win). See $_sc_log"
+    done <<EOL
+$_sc_missing
+EOL
 }
 
 show_usage() {
@@ -782,7 +999,8 @@ APPLICATIONS_PATH="$APPLICATIONS_ROOT/$GAME_NAME_SAFE"
 ZOOM_SHORTCUTS_PATH="$INSTALL_PATH/drive_c/zoom_shortcuts"
 log_info "Creating desktop entries..."
 mkdir -p "$ZOOM_SHORTCUTS_PATH"
-sleep 2 # should be enough time for wine to create shortcuts
+ensure_proton_shortcuts # waits for wine to create the shortcuts and fills in any it missed
+LAUNCHERS_MADE=0
 for file in "$PROTON_SHORTCUTS_PATH"/*.desktop; do
     [ ! -f "$file" ] && continue # safety check if .desktop exists
 
@@ -794,20 +1012,7 @@ for file in "$PROTON_SHORTCUTS_PATH"/*.desktop; do
     _iconname="$(get_desktop_value "Icon" "$file")"
 
     # Skip certain shortcuts
-    case $_wmclass in
-        # Skip uninstaller and PDFs
-        "unins000.exe" | *".pdf")
-            continue
-            ;;
-        # Skip HTML manuals
-        *".html" | *".htm")
-            case $_name in
-                *"Manual"*)
-                    continue
-                    ;;
-            esac
-            ;;
-    esac
+    is_skipped_shortcut "$_wmclass" "$_name" && continue
 
     # Unescape windows path
     _lnkpathlinux=$( (PROTON_VERB=getnativepath umu_launch "$(printf '%s' "$_lnkpathwin" | sed 's/\\\\/\\/g; s/\\ / /g; s/\\\([^\\]\)/\1/g')") 2> /dev/null | head -n 1)
@@ -817,8 +1022,13 @@ for file in "$PROTON_SHORTCUTS_PATH"/*.desktop; do
     _lnk_workingdir=$(printf '%s' "$_lnk" | sed -n 's/WORKING_DIR://p')
     _lnk_args=$(printf '%s' "$_lnk" | sed -n 's/COMMAND_LINE_ARGUMENTS://p')
 
-    # Get absolute path to largest icon
-    _iconpath="$PROTON_SHORTCUTS_PATH/icons/$(find "$PROTON_SHORTCUTS_PATH/icons" -type f -name "*$_iconname.png" -printf '%P\n' | sort -n -tx -k1 -r | head -n 1)"
+    # Get absolute path to largest icon. A shortcut wine couldn't extract an icon for has
+    # no Icon= at all, and searching for "*.png" would pick some other shortcut's icon.
+    _iconpath=""
+    if [ -n "$_iconname" ]; then
+        _iconfile=$(find "$PROTON_SHORTCUTS_PATH/icons" -type f -name "*$_iconname.png" -printf '%P\n' 2> /dev/null | sort -n -tx -k1 -r | head -n 1)
+        [ -n "$_iconfile" ] && _iconpath="$PROTON_SHORTCUTS_PATH/icons/$_iconfile"
+    fi
 
     cat >"$ZOOM_SHORTCUTS_PATH/$_filename.sh" <<EOL
 #!/bin/sh
@@ -828,6 +1038,7 @@ export STORE="zoomplatform"
 $(umu_launch_command) start /b /d "$_lnk_workingdir" "$_lnk_exe" $_lnk_args
 EOL
     chmod +x "$ZOOM_SHORTCUTS_PATH/$_filename.sh"
+    LAUNCHERS_MADE=$((LAUNCHERS_MADE+1))
 
     # Desktop entries do not play well with special characters, and each distro handles them
     # different enough to be annoyingly problematic.
@@ -845,7 +1056,7 @@ EOL
 [Desktop Entry]
 Name=$_name
 Exec=$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID/$_fsum.sh
-Icon=$_iconpath
+${_iconpath:+Icon=$_iconpath}
 StartupWMClass=$_wmclass
 Terminal=false
 Type=Application
@@ -857,6 +1068,11 @@ EOL
         chmod +x "$APPLICATIONS_PATH/$_name.desktop"
     fi
 done
+
+# The install can look successful while having no launcher at all, so say so
+if [ "$SHORTCUTS_KEPT" -gt 0 ] && [ "$LAUNCHERS_MADE" -eq 0 ]; then
+    log_error "The installer created $SHORTCUTS_KEPT shortcut(s) but no launch scripts could be made from them. The game is installed, but new launchers weren't created (any you already had were left as they are). See \"$INSTALL_PATH/drive_c/zoom_menubuilder.log\""
+fi
 
 # A shared prefix can hold more than one install (base game + DLC(s)), each with
 # its own $GAME_NAME_SAFE/applications dir, but they all share one $ZOOM_GUID
