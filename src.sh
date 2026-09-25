@@ -14,6 +14,10 @@ REPO_PATH="https://github.com/ZOOM-Platform/zoom-platform.sh"
 INNOEXT_BIN="/tmp/innoextract_zoom"
 LAUNCH_SCRIPTS_PATH="$HOME"/.local/share/zoom-platform
 APPLICATIONS_ROOT="$HOME"/.local/share/applications/zoom-platform
+# Where wine's own menu builder puts a game's (empty, since Proton disables its menu
+# entries) start menu folder, one per icon group. Not ours, but the uninstaller tidies
+# up the ones it made.
+WINE_MENU_ROOT="$HOME"/.local/share/applications/wine/Programs
 UMU_BIN=umu-run
 CACHE_DIR="$HOME"/.cache/zoom-platform
 
@@ -1488,6 +1492,9 @@ if [ "\$in" = "y" ] || [ "\$in" = "yes" ] || [ "\$in" = "Y" ] || [ "\$in" = "YES
             esac
         done
         rm -rf "$APPLICATIONS_ROOT/\$_group"
+        # Wine's own folder for this group, only if empty (it's shared with every other
+        # wine program, and an earlier install's files there aren't ours to delete)
+        rmdir "$WINE_MENU_ROOT/\$_group" 2> /dev/null
     done
     # Launch script symlinks in \$XDG_DATA_HOME/zoom-platform/
     rm -rf "$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID"
