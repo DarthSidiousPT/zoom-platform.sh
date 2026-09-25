@@ -591,6 +591,20 @@ EOL
     return $_cw_result
 }
 
+# Whether a .desktop in proton_shortcuts was written by wine during this run. Wine keeps one
+# .desktop per shortcut name for the whole prefix, so one that's there can be an earlier
+# install's: a DLC's shortcut with the same name as the base game's, when winemenubuilder
+# didn't run, would find the base game's and take it for its own. Wine rewrites the file on
+# every run, even for identical content (checked with a real reinstall), so a .desktop
+# older than zoom_install_started isn't this run's.
+# $1: path of the .desktop
+is_desktop_from_this_run() {
+    _fr_marker="$INSTALL_PATH/drive_c/zoom_install_started"
+    # Without the marker there's no telling, so trust what's there
+    [ -f "$_fr_marker" ] || return 0
+    [ -n "$(find "$1" -newer "$_fr_marker" 2> /dev/null)" ]
+}
+
 # Shortcut name from its Windows path: the filename without ".lnk". Wine names the
 # .desktop it writes into proton_shortcuts after it, so this is also the .desktop's name.
 get_lnk_name() {
@@ -609,8 +623,9 @@ get_lnk_name() {
 #
 # 1. Any default-verb umu launch runs "wineserver -w" first (Proton's waitforexitandrun),
 #    which waits for every process in the prefix, background winemenubuilders included.
-# 2. Shortcuts that still have no .desktop get winemenubuilder run by hand, with the
-#    winemenubuilder DLL override forced back on for that call only.
+# 2. Shortcuts that still have no .desktop from this run (see is_desktop_from_this_run)
+#    get winemenubuilder run by hand, with the winemenubuilder DLL override forced back
+#    on for that call only.
 # 3. Whatever is still missing is reported by name (not fatal, the game is installed).
 #
 # Only the shortcuts of the installer that just ran are looked at, never the rest of a
@@ -667,8 +682,9 @@ ensure_proton_shortcuts() {
         INSTALL_SHORTCUTS="$INSTALL_SHORTCUTS$_sc_name|"
 
         _sc_desktop="$PROTON_SHORTCUTS_PATH/$_sc_name.desktop"
-        if [ -f "$_sc_desktop" ]; then
-            # Wine made it. The skip rules apply to what wine recorded as the target.
+        if [ -f "$_sc_desktop" ] && is_desktop_from_this_run "$_sc_desktop"; then
+            # Wine made it. (One left by an earlier install doesn't count, it's dealt with as
+            # a missing one below.) The skip rules apply to what wine recorded as the target.
             is_skipped_shortcut "$(get_desktop_value "StartupWMClass" "$_sc_desktop")" "$_sc_name" && continue
             SHORTCUTS_KEPT=$((SHORTCUTS_KEPT+1))
             continue
@@ -739,7 +755,7 @@ EOL
     while IFS= read -r _sc_win; do
         [ -n "$_sc_win" ] || continue
         _sc_name=$(get_lnk_name "$_sc_win")
-        [ -f "$PROTON_SHORTCUTS_PATH/$_sc_name.desktop" ] || \
+        { [ -f "$PROTON_SHORTCUTS_PATH/$_sc_name.desktop" ] && is_desktop_from_this_run "$PROTON_SHORTCUTS_PATH/$_sc_name.desktop"; } || \
             log_error "Couldn't create a launcher for the shortcut \"$_sc_name\" ($_sc_win). See $_sc_log"
     done <<EOL
 $_sc_missing
