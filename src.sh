@@ -252,6 +252,38 @@ test_file_perms() {
     fi
 }
 
+# Check that the install destination can be written to, even if it doesn't exist yet.
+# "test -w" is false for a path that doesn't exist, so this tests the nearest ancestor
+# that does exist instead (that's the folder the install would create it in).
+# Prints the folder that was tested and returns the result of "test -w" on it.
+# Runs from within the flatpak if umu flatpak is being used, in one sandbox start: the
+# sandbox may not see the same paths as the host, so both the "does it exist" walk and
+# the write test have to happen inside it.
+test_dest_writable() {
+    # The path is passed as $1 rather than spliced into the script, so quotes, $ and
+    # spaces in it can't break the script (or run as part of it)
+    # shellcheck disable=SC2016
+    _tdw_script='
+        _p=$1
+        # Walk up until something exists. dirname gives "." for a relative path with no
+        # slash left and "/" for "/", and both are their own dirname, so stop there.
+        while [ ! -e "$_p" ]; do
+            _parent=$(dirname "$_p")
+            [ "$_parent" = "$_p" ] && break
+            _p=$_parent
+        done
+        printf "%s\n" "$_p"
+        test -w "$_p"
+    '
+    if [ "$UMU_BIN" = "FLATPAK" ]; then
+        flatpak run --command=sh org.openwinecomponents.umu.umu-launcher -c "$_tdw_script" sh "$1"
+        return $?
+    else
+        sh -c "$_tdw_script" sh "$1"
+        return $?
+    fi
+}
+
 # Loose check if dir is a wine prefix
 is_valid_prefix() {
     _wine_prefix="$1"
@@ -828,15 +860,17 @@ if [ -z "$INSTALL_PATH" ]; then
     fi
 fi
 
-# Show an error if install destination isn't writable, only do this for the Flatpak
-if [ "$UMU_BIN" = "FLATPAK" ] && ! test_file_perms w "$INSTALL_PATH"; then
-    _msg="The umu Flatpak does not have write permissions to the install directory."
-    if [ $CAN_USE_DIALOGS -eq 1 ]; then
-        dialog_msgbox error "No permissions" "$_msg\n$INSTALL_PATH"
-        exit 1
-    else
-        fatal_error "$_msg"
+# Show an error if install destination isn't writable, only do this for the Flatpak.
+# The destination may not exist yet, so what's tested is its nearest existing folder.
+if [ "$UMU_BIN" = "FLATPAK" ] && ! _dest_checked=$(test_dest_writable "$INSTALL_PATH"); then
+    _nl='
+'
+    _msg="The umu Flatpak does not have write permissions to the install directory.$_nl$INSTALL_PATH"
+    if [ "$_dest_checked" != "$INSTALL_PATH" ]; then
+        _msg="$_msg${_nl}(it doesn't exist yet, so this was checked: $_dest_checked)"
     fi
+    # Also prints the message in the terminal, not just in the popup
+    fatal_error "$_msg" "No permissions"
 fi
 
 export WINEPREFIX="$INSTALL_PATH"
