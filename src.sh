@@ -89,6 +89,56 @@ log_error() {
     printf "\033[31;1mERROR:\033[0m %s\n" "$*" >&2
 }
 
+log_warning() {
+    printf "\033[33;1mWARNING:\033[0m %s\n" "$*" >&2
+}
+
+# Asks a yes/no question where "no" is the safe default, in a dialog if possible,
+# otherwise in the terminal. Returns 0 only if the user chose to continue.
+# The terminal question reads from /dev/tty: stdin can't be used since the script
+# itself may be coming in through it (cat zoom-platform.sh | sh).
+# $1: Title
+# $2: Message
+ask_continue() {
+    _ac_title=$1
+    _ac_msg=$2
+
+    log_warning "$_ac_title"
+    printf '%s\n' "$_ac_msg" >&2
+
+    if [ $CAN_USE_DIALOGS -eq 1 ]; then
+        if [ $USE_ZENITY -eq 1 ]; then
+            zenity --question --no-wrap --title="$_ac_title" --text="$_ac_msg" \
+                --ok-label="Continue" --cancel-label="Cancel"
+        else
+            kdialog --warningcontinuecancel "$_ac_msg" --title "$_ac_title"
+        fi
+        return $?
+    fi
+
+    # Test the redirect in a subshell first, a failing redirect on read can kill the shell
+    if ( : < /dev/tty ) 2> /dev/null; then
+        printf 'Continue anyway? [y/N] ' >&2
+        read -r _ac_answer < /dev/tty
+        case $_ac_answer in
+            [yY] | [yY][eE][sS]) return 0 ;;
+        esac
+    else
+        log_warning "No terminal to ask on, so not continuing."
+    fi
+    return 1
+}
+
+# Prints a byte count like ZOOM Platform's download page does (1024-based, "GB")
+# $1: Bytes
+format_size() {
+    awk -v _b="$1" 'BEGIN {
+        if (_b >= 1073741824) printf "%.2f GB", _b / 1073741824
+        else if (_b >= 1048576) printf "%.2f MB", _b / 1048576
+        else printf "%.0f KB", _b / 1024
+    }'
+}
+
 # Shows an error dialog and an error message then exits
 # $1: Error message
 # $2: Msgbox title (optional)
@@ -281,6 +331,148 @@ test_dest_writable() {
     else
         sh -c "$_tdw_script" sh "$1"
         return $?
+    fi
+}
+
+# Prints the size a slice (.bin) file says it has, from its own header.
+# Inno Setup starts every slice with an 8 byte magic, followed by the slice's size
+# as a little-endian number (this is what innoextract's slice_reader checks too):
+#   "idska16" 0x1a, "idska32" 0x1a: 4 byte size (offset 8-11)
+#   "idskb32" 0x1a:                 8 byte size (offset 8-15)
+# A file that was cut short still has this header, so it can be compared to its
+# real size. Returns 1 if the file doesn't start with a slice magic.
+# $1: Slice file
+get_slice_size() {
+    _gss_file=$1
+
+    # First 8 bytes as hex, with od's padding spaces and newline removed
+    _gss_magic=$(od -A n -t x1 -N 8 "$_gss_file" 2> /dev/null | tr -d ' \n')
+    case $_gss_magic in
+        6964736b6131361a | 6964736b6133321a) _gss_len=4 ;; # idska16, idska32
+        6964736b6233321a) _gss_len=8 ;;                    # idskb32
+        *) return 1 ;;
+    esac
+
+    # od prints one decimal number per byte, least significant first. Weight each by
+    # 256^position. %.0f, not %d: some awks clamp %d to 32 bits and a slice is over 2GB.
+    # No numbers at all means the file ends right after the magic.
+    od -A n -t u1 -j 8 -N "$_gss_len" "$_gss_file" 2> /dev/null |
+        awk 'BEGIN { m = 1 } { for (i = 1; i <= NF; i++) { s += $i * m; m *= 256 } } END { if (NR == 0) exit 1; printf "%.0f", s }'
+}
+
+# Prints what's wrong with a slice file. Prints nothing if it looks complete.
+# Only a file smaller than its own header says is reported, that's what a
+# half-finished download looks like.
+# $1: Slice file
+describe_slice_problem() {
+    _dsp_file=$1
+
+    # wc pads its output with spaces on some systems
+    _dsp_have=$(wc -c < "$_dsp_file" | tr -d ' ')
+    if ! _dsp_want=$(get_slice_size "$_dsp_file"); then
+        printf 'not an installer data file'
+    elif [ "$_dsp_have" -lt "$_dsp_want" ]; then
+        printf 'incomplete, %s of %s' "$(format_size "$_dsp_have")" "$(format_size "$_dsp_want")"
+    fi
+}
+
+# Big installers are split into several .bin files that have to sit next to the
+# installer .exe and be named exactly "<installer name>-1.bin", "-2.bin", ...
+# Inno Setup only looks for a file when it gets to it, so a part that's missing
+# (or that a browser saved as "...-2 (1).bin" or "...-2(1).bin" because the first
+# download failed or was repeated) would only show up in the middle of the install.
+# This checks everything up front:
+# - Something missing or misnamed: stops and says what to rename.
+# - Something looks incomplete: warns, and continues if the user says so.
+# Needs "slice_count" from the innoextract fork's --print-headers. Without it (older
+# innoextract, or the data is inside the .exe) there's nothing to check.
+check_installer_slices() {
+    _cis_count=$(get_header_val 'slice_count')
+    case $_cis_count in
+        '' | 0 | *[!0-9]*) return 0 ;;
+    esac
+
+    # These name their slices differently: before 4.1.7 from a name stored in the
+    # headers, and with more than one slice per disk they get a letter suffix.
+    # No ZOOM installer does either, so those aren't handled here.
+    _cis_spd=$(get_header_val 'slices_per_disk')
+    _cis_ver=$(get_header_val 'setup_version')
+    _cis_ver=${_cis_ver%% *} # "6.6.0 (unicode)" -> "6.6.0"
+    case $_cis_ver in
+        [1-3].* | 4.0.* | 4.1.[0-6])
+            log_info "Old Inno Setup ($_cis_ver), not checking the .bin files"
+            return 0 ;;
+    esac
+    if [ -n "$_cis_spd" ] && [ "$_cis_spd" != 1 ]; then
+        log_info "Installer uses $_cis_spd slices per disk, not checking the .bin files"
+        return 0
+    fi
+
+    _cis_dir=$(dirname "$INPUT_INSTALLER")
+    _cis_exe=${INPUT_INSTALLER##*/}
+    _cis_stem=${_cis_exe%.*}
+    # The name without a duplicate counter a browser may have added: "Setup (1)" -> "Setup"
+    _cis_orig=$(printf '%s' "$_cis_stem" | sed 's/ \{0,1\}([0-9]\{1,\})$//')
+
+    _cis_nl='
+'
+    _cis_missing=''    # Lines about parts that aren't there under the right name
+    _cis_incomplete='' # Lines about parts that are there but look cut short
+
+    _cis_n=1
+    while [ "$_cis_n" -le "$_cis_count" ]; do
+        # The name Inno Setup will look for
+        _cis_want="$_cis_dir/$_cis_stem-$_cis_n.bin"
+
+        if [ -f "$_cis_want" ]; then
+            if ! test_file_perms r "$_cis_want"; then
+                _cis_missing="$_cis_missing$_cis_nl- Part $_cis_n of $_cis_count can't be read by the installer (permissions): ${_cis_want##*/}"
+            else
+                _cis_problem=$(describe_slice_problem "$_cis_want")
+                [ -n "$_cis_problem" ] && _cis_incomplete="$_cis_incomplete$_cis_nl- ${_cis_want##*/}: $_cis_problem"
+            fi
+        else
+            _cis_found=0
+            # Same part under the names browsers give repeated downloads, and under the
+            # installer's name without its own counter (in case the .exe is what was renamed)
+            for _cis_cand in \
+                "$_cis_dir/$_cis_orig-$_cis_n.bin" \
+                "$_cis_dir/$_cis_stem-$_cis_n ("[0-9]*").bin" \
+                "$_cis_dir/$_cis_stem-$_cis_n("[0-9]*").bin" \
+                "$_cis_dir/$_cis_orig-$_cis_n ("[0-9]*").bin" \
+                "$_cis_dir/$_cis_orig-$_cis_n("[0-9]*").bin"
+            do
+                # A pattern that matched nothing stays as text, and -f skips it
+                [ -f "$_cis_cand" ] || continue
+                # The same file can match more than one pattern when stem and orig are the same
+                case $_cis_missing in *"\"${_cis_cand##*/}\""*) continue ;; esac
+                _cis_found=1
+                _cis_problem=$(describe_slice_problem "$_cis_cand")
+                _cis_note=''
+                [ -n "$_cis_problem" ] && _cis_note=" ($_cis_problem)"
+                _cis_missing="$_cis_missing$_cis_nl- Part $_cis_n of $_cis_count: rename \"${_cis_cand##*/}\"$_cis_note to \"${_cis_want##*/}\""
+            done
+            [ $_cis_found -eq 0 ] && _cis_missing="$_cis_missing$_cis_nl- Part $_cis_n of $_cis_count not found: ${_cis_want##*/}"
+        fi
+        _cis_n=$((_cis_n+1))
+    done
+
+    if [ -n "$_cis_missing" ]; then
+        _cis_msg="This installer comes in $_cis_count data files (.bin) that must be in the same folder, with names that start with the installer's:$_cis_nl$_cis_dir$_cis_nl$_cis_missing"
+        [ -n "$_cis_incomplete" ] && _cis_msg="$_cis_msg$_cis_nl${_cis_nl}These also look wrong:$_cis_incomplete"
+        # If the installer itself was renamed, renaming it back is an alternative
+        if [ "$_cis_stem" != "$_cis_orig" ]; then
+            _cis_msg="$_cis_msg$_cis_nl${_cis_nl}The installer's own name has a download counter too. If the .bin files have the original names, renaming the installer back to \"$_cis_orig${_cis_exe#"$_cis_stem"}\" is enough."
+        fi
+        fatal_error "$_cis_msg${_cis_nl}${_cis_nl}Fix the names and run the script again." "Installer files missing"
+    fi
+
+    if [ -n "$_cis_incomplete" ]; then
+        ask_continue "Installer files look damaged or incomplete" \
+            "These files don't look right, their download probably didn't finish:$_cis_incomplete${_cis_nl}${_cis_nl}The installation will most likely fail partway through." ||
+            fatal_error "Cancelled. Download the incomplete files again and run the script again." "Cancelled"
+    else
+        log_info "Found all $_cis_count installer data files"
     fi
 }
 
@@ -902,7 +1094,8 @@ fi
 
 INSTALLER_INFO=$($INNOEXT_BIN -s --print-headers "$INPUT_INSTALLER")
 get_header_val () {
-    printf '%s' "$INSTALLER_INFO" | sed -n "s/$1: \"\(.*\)\"/\1/p; s/$1: \(.*\)/\1/p" # Handles with and without quotes
+    # Anchored so a key can't match the end of a longer one (file_count vs data_file_count)
+    printf '%s' "$INSTALLER_INFO" | sed -n "s/^$1: \"\(.*\)\"/\1/p; s/^$1: \(.*\)/\1/p" # Handles with and without quotes
 }
 
 INNO_APPID=$(get_header_val 'app_id' | sed 's/[{}]//g') # Strip {{}
@@ -924,6 +1117,9 @@ IS DLC: \033[39;49;1m%s\033[0m
 "$(get_header_val 'app_version')" \
 "$ZOOM_GUID" \
 "$([ "$IS_DLC" -eq 1 ] && printf "yes" || printf "no")"
+
+# Split installers: make sure all the .bin files are there before anything is touched
+check_installer_slices
 
 # Open file selector if DEST wasn't given
 if [ -z "$INSTALL_PATH" ]; then
