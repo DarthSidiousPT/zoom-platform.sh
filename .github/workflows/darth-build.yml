@@ -1,14 +1,15 @@
 name: Build (Darth fork)
 
-# Fork-only build: produces a renamed zoom-platform-darth.sh and publishes it to a
-# rolling "darth-latest" GitHub Release on every push to this fork's main, plus a
-# permanent release tagged from the VERSION file's own content (e.g. "Darth-1.0.2" - an
-# independent version string, not derived from ZOOM's own version numbers) whenever
-# that hasn't been released yet (same VERSION-file-driven scheme as the innoextract
-# fork's own darth-build.yml - bump VERSION by hand to cut a new fork release; a plain
-# push that doesn't touch it just refreshes darth-latest). Guarded by the repository
-# check below so that if this file is ever pulled into Zoom's official repo (e.g. by
-# accident via a future PR), it stays inert there instead of running.
+# Fork-only build: produces a renamed zoom-platform-darth.sh on every push to this fork's
+# main. Whenever the VERSION file's own content (e.g. "Darth-1.2.0" - an independent
+# version string, not derived from ZOOM's own version numbers) hasn't been released yet,
+# it also publishes it as a permanent GitHub Release tagged and titled with that string,
+# marked as the latest release, with the body taken from RELEASE_NOTES.md plus a "Not an
+# official ZOOM Platform release" quote (same scheme as the innoextract fork's own
+# darth-build.yml - bump VERSION by hand and update RELEASE_NOTES.md to cut a release; a
+# plain push that doesn't touch VERSION only builds). Guarded by the repository check
+# below so that if this file is ever pulled into Zoom's official repo (e.g. by accident
+# via a future PR), it stays inert there instead of running.
 on:
   push:
     branches:
@@ -35,10 +36,8 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          # VERSION already carries its own "Darth-" identifier (e.g. "Darth-1.0.2"),
-          # so the tag is just that string as-is - no extra "darth-" prefix needed
-          # (unlike darth-latest/the old per-commit-sha tags, which had nothing of
-          # their own to identify them as fork builds).
+          # VERSION already carries its own "Darth-" identifier (e.g. "Darth-1.2.0"),
+          # so the tag is just that string as-is - no extra "darth-" prefix needed.
           echo "tag=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check whether that version was already released
@@ -62,39 +61,26 @@ jobs:
           name: zoom-platform-darth
           path: zoom-platform-darth.sh
 
-      - name: Move rolling darth-latest tag to this commit
+      # The release body is RELEASE_NOTES.md (edit it in the same commit that bumps
+      # VERSION) followed by the "Not an official" quote, so that line is never forgotten.
+      # A missing RELEASE_NOTES.md fails this step, before anything is published.
+      - name: Compose the release notes
+        if: steps.check.outputs.is_new == 'true'
         run: |
-          git tag -f darth-latest
-          git push -f origin darth-latest
-
-      # ncipollo/release-action's allowUpdates only PATCHes the existing release object,
-      # which keeps its original "published" date forever even though the tag/asset just
-      # moved. Delete it first so the next step always does a fresh create instead, and
-      # the release's date stays honest about when this build actually happened.
-      - name: Delete previous rolling release (so its date reflects this build)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release delete darth-latest --yes --repo "${{ github.repository }}" || true
-
-      - name: Publish rolling latest release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: darth-latest
-          artifacts: "zoom-platform-darth.sh"
-          name: "Darth fork build (latest main)"
-          body: "Automated build of zoom-platform.sh ${{ steps.ver.outputs.version }} from ${{ github.repository }}@${{ github.sha }}. Not an official ZOOM Platform release."
-          allowUpdates: true
-          makeLatest: false
+          {
+            cat RELEASE_NOTES.md
+            printf '\n> Not an official ZOOM Platform release.\n'
+          } > release_body.md
 
       # Only published when VERSION was bumped, so a plain push to main that didn't
-      # change VERSION just updates darth-latest above instead of minting a new tag.
+      # change VERSION just builds.
       - name: Publish versioned release
         if: steps.check.outputs.is_new == 'true'
         uses: ncipollo/release-action@v1
         with:
           tag: "${{ steps.ver.outputs.tag }}"
           artifacts: "zoom-platform-darth.sh"
-          name: "${{ steps.ver.outputs.version }}"
-          body: "Automated build of zoom-platform.sh ${{ steps.ver.outputs.version }} from ${{ github.repository }}@${{ github.sha }}. Not an official ZOOM Platform release."
+          name: "${{ steps.ver.outputs.tag }}"
+          bodyFile: release_body.md
           allowUpdates: false
-          makeLatest: false
+          makeLatest: true

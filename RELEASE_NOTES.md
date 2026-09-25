@@ -1,0 +1,1 @@
+Installers that come in several `.bin` files (like Necro Vision) are now checked before the install starts: if a part is missing or was renamed by the browser (`-1 (1).bin`), the script says which file to rename instead of failing halfway through. Uninstalling also removes the empty menu folder wine leaves behind.
