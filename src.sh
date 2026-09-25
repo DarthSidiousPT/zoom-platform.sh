@@ -517,21 +517,78 @@ get_install_lnks() {
     ' "$INSTALL_PATH/drive_c/zoom_installer.log"
 }
 
-# Fallback for get_install_lnks: find this game's shortcuts on disk instead. Looks in
-# its own Start Menu folder (named after default_group_name) under both the common
-# and the per-user Start Menu. Prints Windows paths like get_install_lnks.
+# Print the native path of every shortcut (.lnk) in the places an installer puts them:
+# the common and the per-user Start Menu, and the Public Desktop ({commondesktop}).
+# The shortcuts of a prefix are shared by every install in it (base game + DLC), so
+# what tells this run's apart is when they were written: zoom_install_started is created
+# right before the installer is launched.
+# $1: "new" for the shortcuts written since then (this run's), "old" for all the others
 # Newlines in shortcut names aren't handled (Windows doesn't allow them anyway).
+list_lnks_on_disk() {
+    _ll_drive_c="$INSTALL_PATH/drive_c"
+    _ll_marker="$_ll_drive_c/zoom_install_started"
+    # Without the marker there's no telling which run wrote what
+    [ -f "$_ll_marker" ] || return 0
+    if [ "$1" = "new" ]; then
+        set -- -newer "$_ll_marker"
+    else
+        set -- ! -newer "$_ll_marker"
+    fi
+    find "$_ll_drive_c/ProgramData/Microsoft/Windows/Start Menu" \
+         "$_ll_drive_c"/users/*/AppData/Roaming/Microsoft/Windows/"Start Menu" \
+         "$_ll_drive_c/users/Public/Desktop" \
+         -iname '*.lnk' "$@" 2> /dev/null
+}
+
+# Fallback for get_install_lnks: this run's shortcuts found on disk instead, the .lnk files
+# written since the installer was launched (see list_lnks_on_disk). Unlike a search by
+# Start Menu folder this also finds Desktop-only shortcuts, and never another install's.
+# Prints Windows paths like get_install_lnks.
 find_install_lnks() {
-    [ -n "$GAME_NAME_SAFE" ] || return 0
     _fl_drive_c="$INSTALL_PATH/drive_c"
-    find "$_fl_drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs/$GAME_NAME_SAFE" \
-         "$_fl_drive_c"/users/*/AppData/Roaming/Microsoft/Windows/"Start Menu/Programs/$GAME_NAME_SAFE" \
-         -iname '*.lnk' 2> /dev/null | while IFS= read -r _fl_lnk; do
+    list_lnks_on_disk new | while IFS= read -r _fl_lnk; do
         # Strip the (literal, hence quoted) prefix up to drive_c, then / -> \ (octal 134,
         # to keep a literal backslash out of the quoting) and put C:\ back
         _fl_win=$(printf '%s' "${_fl_lnk#"$_fl_drive_c/"}" | tr '/' '\134')
         printf '%s\n' "C:\\$_fl_win"
     done
+}
+
+# The parts of a shortcut that decide what it launches: target, working dir and arguments.
+# Empty if the .lnk can't be parsed.
+# $1: native path of the .lnk
+lnk_launch_signature() {
+    parse_lnk "$1" 2> /dev/null | grep -E '^(LocalBasePath|WORKING_DIR|COMMAND_LINE_ARGUMENTS):'
+}
+
+# For a DLC's shortcut: compare it with the shortcuts of the same name that were already in
+# the prefix before this run (the base game's, most likely).
+# $1: native path of this run's .lnk
+# $2: shortcut name (the .lnk filename without extension)
+# Returns 0 if one of them launches exactly the same thing (nothing new to make a launcher
+# for), 2 if there are some but they launch something else (this one is the DLC's own, and
+# it can't take the name), 1 if there's none.
+compare_with_existing_lnk() {
+    _cw_sig=$(lnk_launch_signature "$1")
+    _cw_name=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+    _cw_result=1
+    # Names are compared here, and not with find -name, because a name can have glob
+    # characters in it ([, *, ?). Case-insensitive, like wine.
+    while IFS= read -r _cw_other; do
+        [ -n "$_cw_other" ] || continue
+        _cw_base=${_cw_other##*/}
+        _cw_base=$(printf '%s' "${_cw_base%.[lL][nN][kK]}" | tr '[:upper:]' '[:lower:]')
+        [ "$_cw_base" = "$_cw_name" ] || continue
+        _cw_result=2
+        # An unreadable .lnk (empty signature) is never "the same"
+        if [ -n "$_cw_sig" ] && [ "$(lnk_launch_signature "$_cw_other")" = "$_cw_sig" ]; then
+            _cw_result=0
+            break
+        fi
+    done <<EOL
+$(list_lnks_on_disk old)
+EOL
+    return $_cw_result
 }
 
 # Shortcut name from its Windows path: the filename without ".lnk". Wine names the
@@ -556,26 +613,37 @@ get_lnk_name() {
 #    winemenubuilder DLL override forced back on for that call only.
 # 3. Whatever is still missing is reported by name (not fatal, the game is installed).
 #
+# Only the shortcuts of the installer that just ran are looked at, never the rest of a
+# shared prefix (a base game and its DLC): they come from the installer's own log, or, if
+# that gives none, from the .lnk files written since it was launched.
+#
 # Sets SHORTCUTS_KEPT to how many shortcuts this install has that should get a launcher.
+# Sets INSTALL_SHORTCUTS to the names of all of this run's shortcuts, as "|name|name|",
+# and INSTALL_DESKTOP_SHORTCUTS the same for the ones that are on the Desktop. A shortcut
+# not in the first isn't this install's, and gets no launcher. An empty list is empty: a DLC
+# with no shortcuts of its own has nothing to make.
 # Output of the umu calls goes to drive_c/zoom_menubuilder.log.
 # Idea from upstream's 672c694 ("Run winemenubuilder manually").
 ensure_proton_shortcuts() {
     _sc_log="$INSTALL_PATH/drive_c/zoom_menubuilder.log"
     SHORTCUTS_KEPT=0
+    INSTALL_SHORTCUTS='|'
+    INSTALL_DESKTOP_SHORTCUTS='|'
 
     _sc_links=$(get_install_lnks)
     [ -n "$_sc_links" ] || _sc_links=$(find_install_lnks)
     if [ -z "$_sc_links" ]; then
         _sc_icon_count=$(get_header_val 'icon_count')
+        # The Start Menu entries can't be turned off in the installer (the Desktop one can), so
+        # an installer that defines shortcuts and made none is worth telling about
         [ "${_sc_icon_count:-0}" -gt 0 ] && \
-            log_error "No shortcuts were created by the installer (it defines ${_sc_icon_count}), so there are no launchers. If you deselected the shortcut options in the installer that's expected."
+            log_error "The installer defines ${_sc_icon_count} shortcut(s) but none were created, so there are no launchers. The game is installed in \"$INSTALL_PATH\"."
     fi
 
     # Sync point, see (1) above. Any cheap command works, hostname has no side effects.
     # UMU_CONTAINER_NSENTER would switch umu to a verb that doesn't wait.
     ( unset UMU_CONTAINER_NSENTER; umu_launch hostname ) >> "$_sc_log" 2>&1 < /dev/null
 
-    _sc_seen='|'
     _sc_missing=''
     _sc_nl='
 '
@@ -586,11 +654,17 @@ ensure_proton_shortcuts() {
         [ -n "$_sc_win" ] || continue
         _sc_name=$(get_lnk_name "$_sc_win")
 
+        # Note which ones the installer put on the Desktop (C:\users\<user>\Desktop\..., the
+        # Public one for everyone), before the check below drops the Desktop copy of a name
+        case $_sc_win in
+            *\\[Dd]esktop\\*) INSTALL_DESKTOP_SHORTCUTS="$INSTALL_DESKTOP_SHORTCUTS$_sc_name|" ;;
+        esac
+
         # The Desktop and Start Menu copies of a shortcut share one .desktop, only handle it once
-        case $_sc_seen in
+        case $INSTALL_SHORTCUTS in
             *"|$_sc_name|"*) continue ;;
         esac
-        _sc_seen="$_sc_seen$_sc_name|"
+        INSTALL_SHORTCUTS="$INSTALL_SHORTCUTS$_sc_name|"
 
         _sc_desktop="$PROTON_SHORTCUTS_PATH/$_sc_name.desktop"
         if [ -f "$_sc_desktop" ]; then
@@ -938,6 +1012,10 @@ EOL
 fi
 
 printf "\n" > "$INSTALL_PATH/drive_c/zoom_installer.log"
+# Everything the installer writes from here on is newer than this file, which is how
+# this run's shortcuts are told apart from the ones already in a shared prefix
+# (see list_lnks_on_disk)
+: > "$INSTALL_PATH/drive_c/zoom_install_started"
 
 # If installer doesn't have custom components then it can be installed silently
 # Disabling for now, need to figure out how to reliably check this
@@ -1035,10 +1113,24 @@ log_info "Creating desktop entries..."
 mkdir -p "$ZOOM_SHORTCUTS_PATH"
 ensure_proton_shortcuts # waits for wine to create the shortcuts and fills in any it missed
 LAUNCHERS_MADE=0
+DUPLICATE_SHORTCUTS=0 # this run's shortcuts that are copies of ones already there, so get no launcher
+# One "<shortcut name>|<launcher name>" line for each launcher made, for the Desktop links.
+# They differ for a DLC's shortcut that has the name of one the base game already has.
+LAUNCHER_MAP=''
+_nl='
+'
 for file in "$PROTON_SHORTCUTS_PATH"/*.desktop; do
     [ ! -f "$file" ] && continue # safety check if .desktop exists
 
     _filename=$(basename "$file" ".desktop")
+    # The prefix's proton_shortcuts holds what wine made for every install that was ever
+    # run in it, and only this run's shortcuts are this run's to make launchers for
+    case $INSTALL_SHORTCUTS in
+        *"|$_filename|"*) ;;
+        *) continue ;;
+    esac
+    _shortcut_name=$_filename # what the installer called it; _filename may become the launcher's name below
+
     # Get some values from the .desktop
     _name="$(get_desktop_value "Name" "$file")"
     _lnkpathwin="$(get_desktop_value "Exec" "$file")"
@@ -1050,6 +1142,29 @@ for file in "$PROTON_SHORTCUTS_PATH"/*.desktop; do
 
     # Unescape windows path
     _lnkpathlinux=$( (PROTON_VERB=getnativepath umu_launch "$(printf '%s' "$_lnkpathwin" | sed 's/\\\\/\\/g; s/\\ / /g; s/\\\([^\\]\)/\1/g')") 2> /dev/null | head -n 1)
+    # A DLC can have a shortcut with the same name as one of the base game's (both share the
+    # same proton_shortcuts/<name>.desktop, launch script and menu entry name).
+    # If it launches the same thing there's nothing to add. If it launches something else,
+    # its arguments probably are what starts the DLC, so it's kept, under the DLC's name
+    # so that it doesn't overwrite the base game's launcher.
+    if [ $IS_DLC -eq 1 ]; then
+        compare_with_existing_lnk "$_lnkpathlinux" "$_shortcut_name"
+        case $? in
+            0)
+                DUPLICATE_SHORTCUTS=$((DUPLICATE_SHORTCUTS+1))
+                continue
+                ;;
+            2)
+                _filename=$GAME_NAME_SAFE
+                # A second one in the same run can't have the same name too
+                case $LAUNCHER_MAP in
+                    *"|$_filename$_nl"*) _filename="$GAME_NAME_SAFE ($_shortcut_name)" ;;
+                esac
+                _name=$_filename
+                ;;
+        esac
+    fi
+
     # Get values from .lnk
     _lnk="$(parse_lnk "$_lnkpathlinux")"
     _lnk_exe=$(printf '%s' "$_lnk" | sed -n 's/LocalBasePath://p')
@@ -1073,6 +1188,7 @@ $(umu_launch_command) start /b /d "$_lnk_workingdir" "$_lnk_exe" $_lnk_args
 EOL
     chmod +x "$ZOOM_SHORTCUTS_PATH/$_filename.sh"
     LAUNCHERS_MADE=$((LAUNCHERS_MADE+1))
+    LAUNCHER_MAP="$LAUNCHER_MAP$_shortcut_name|$_filename$_nl"
 
     # Desktop entries do not play well with special characters, and each distro handles them
     # different enough to be annoyingly problematic.
@@ -1104,7 +1220,7 @@ EOL
 done
 
 # The install can look successful while having no launcher at all, so say so
-if [ "$SHORTCUTS_KEPT" -gt 0 ] && [ "$LAUNCHERS_MADE" -eq 0 ]; then
+if [ $((SHORTCUTS_KEPT-DUPLICATE_SHORTCUTS)) -gt 0 ] && [ "$LAUNCHERS_MADE" -eq 0 ]; then
     log_error "The installer created $SHORTCUTS_KEPT shortcut(s) but no launch scripts could be made from them. The game is installed, but new launchers weren't created (any you already had were left as they are). See \"$INSTALL_PATH/drive_c/zoom_menubuilder.log\""
 fi
 
@@ -1172,15 +1288,24 @@ chmod +x "$INSTALL_PATH/uninstall.sh"
 
 # If user chose to create Desktop shortcuts in the installer, symlink to XDG desktop
 # Shortcut names placed on the Desktop are always the same as what was made in the Start Menu
+# Only the ones this run's installer put on the Desktop, and only for the launchers it made:
+# a Desktop shortcut from an earlier install in the same prefix is that install's, and
+# leaving the box unticked this time doesn't remove it (or re-point it).
 if [ $CREATE_DESKTOP_ENTRIES -eq 1 ]; then
-    for file in "$INSTALL_PATH/drive_c/users/Public/Desktop"/*.lnk; do
-        _filename=$(basename "$file" ".lnk")
-        _existingdesktoppath="$APPLICATIONS_PATH/$_filename.desktop"
-        if [ -f "$_existingdesktoppath" ] && [ -f "$file" ]; then
-            log_info "Creating \"$DESKTOP_DIR/$_filename.desktop\""
-            ln -sf "$_existingdesktoppath" "$DESKTOP_DIR/$_filename.desktop"
+    while IFS='|' read -r _shortcut_name _launcher_name; do
+        [ -n "$_shortcut_name" ] || continue
+        case $INSTALL_DESKTOP_SHORTCUTS in
+            *"|$_shortcut_name|"*) ;;
+            *) continue ;;
+        esac
+        _existingdesktoppath="$APPLICATIONS_PATH/$_launcher_name.desktop"
+        if [ -f "$_existingdesktoppath" ]; then
+            log_info "Creating \"$DESKTOP_DIR/$_launcher_name.desktop\""
+            ln -sf "$_existingdesktoppath" "$DESKTOP_DIR/$_launcher_name.desktop"
         fi
-    done
+    done <<EOL
+$LAUNCHER_MAP
+EOL
     printf "\n"
     log_info "Installation complete! You can now launch your games from the applications launcher."
     log_info "To add to your Steam library, from within Steam go to \"Games\" -> \"Add a Non-Steam Game to My Library\" then select it from the popup."
