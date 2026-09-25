@@ -1,7 +1,7 @@
 name: Build (Darth fork)
 
 # Fork-only build: produces a renamed zoom-platform-darth.sh on every push to this fork's
-# main. Whenever the VERSION file's own content (e.g. "Darth-1.2.0" - an independent
+# main. Whenever the VERSION file's own content (e.g. "v1.2.0-darth" - an independent
 # version string, not derived from ZOOM's own version numbers) hasn't been released yet,
 # it also publishes it as a permanent GitHub Release tagged and titled with that string,
 # marked as the latest release, with the body taken from RELEASE_NOTES.md plus a "Not an
@@ -36,8 +36,9 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          # VERSION already carries its own "Darth-" identifier (e.g. "Darth-1.2.0"),
-          # so the tag is just that string as-is - no extra "darth-" prefix needed.
+          # VERSION is already the full version string, with its "v" and "-darth"
+          # (e.g. "v1.2.0-darth"), so the tag is just that string as-is. Older releases
+          # (Darth-1.0.2 ... Darth-1.2.0) predate this naming and are left as they are.
           echo "tag=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check whether that version was already released
