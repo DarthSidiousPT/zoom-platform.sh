@@ -10,7 +10,7 @@ INNOEXTRACT_BINARY_B64=0
 #__INNOEXTRACT_BINARY_END__
 
 INSTALLER_VERSION="DEV"
-REPO_PATH="https://github.com/ZOOM-Platform/zoom-platform.sh"
+REPO_PATH="https://github.com/DarthSidiousPT/zoom-platform.sh"
 INNOEXT_BIN="/tmp/innoextract_zoom"
 LAUNCH_SCRIPTS_PATH="$HOME"/.local/share/zoom-platform
 APPLICATIONS_ROOT="$HOME"/.local/share/applications/zoom-platform
