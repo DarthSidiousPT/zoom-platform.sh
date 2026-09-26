@@ -11,6 +11,9 @@ INNOEXTRACT_BINARY_B64=0
 
 INSTALLER_VERSION="DEV"
 REPO_PATH="https://github.com/DarthSidiousPT/zoom-platform.sh"
+# Optional per-game fixes (see game-fixes.ini), read while installing. Kept in a file
+# of its own so a game's quirk doesn't need a change to this script.
+GAME_FIXES_URL="https://raw.githubusercontent.com/DarthSidiousPT/zoom-platform.sh/main/game-fixes.ini"
 INNOEXT_BIN="/tmp/innoextract_zoom"
 LAUNCH_SCRIPTS_PATH="$HOME"/.local/share/zoom-platform
 APPLICATIONS_ROOT="$HOME"/.local/share/applications/zoom-platform
@@ -958,6 +961,251 @@ $_sc_missing
 EOL
 }
 
+# Reads a file in the game-fixes.ini format and prints one line for each launcher that
+# belongs to the game $2:  name|replaces|exe|workdir|args
+# A launcher that can't be used comes out as  !|name|reason  instead, for the caller to
+# warn about. The file comes off the network and its values end up inside a generated
+# shell script (args unquoted), so every value is checked here against a short list of
+# allowed characters, and none can hold the "|" that separates the fields above.
+# $1: the file
+# $2: ZOOM game GUID
+parse_game_fixes() {
+    awk -v guid="$2" '
+        function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+        # Does s hold any of the characters in set?
+        function has_any(s, set,    i) {
+            for (i = 1; i <= length(set); i++)
+                if (index(s, substr(set, i, 1))) return 1
+            return 0
+        }
+        # Is every character of s in set?
+        function only(s, set,    i) {
+            for (i = 1; i <= length(s); i++)
+                if (!index(set, substr(s, i, 1))) return 0
+            return 1
+        }
+        # Names end up in file names, in .desktop files and in the lines printed below
+        function bad_name(s) { return s == "" || s ~ /^[.]/ || has_any(s, "/|\\\"$`\t\r") }
+        # A Windows path below the game folder: no drive, no "..", no empty parts
+        function bad_path(p,    q) {
+            if (!only(p, ALNUM " ._()+,-\\")) return "has characters that are not allowed"
+            q = p
+            gsub(/\\/, "/", q) # from here on a plain / separates the parts
+            if (q ~ /^\// || q ~ /\/$/ || q ~ /\/\// || q ~ /(^|\/)[.][.](\/|$)/) return "is not a plain relative path"
+            return ""
+        }
+        # Prints the launcher collected so far, if it belongs to this game
+        function finish(    why, r, n) {
+            if (!mine) return
+            why = ""
+            if (bad_name(name)) why = "the launcher name is empty or has characters that are not allowed"
+            if (why == "" && bad_name(replaces)) why = "replaces is missing or has characters that are not allowed"
+            if (why == "" && exe == "") why = "exe is missing"
+            if (why == "") { r = bad_path(exe); if (r != "") why = "exe " r }
+            if (why == "" && workdir != "") { r = bad_path(workdir); if (r != "") why = "workdir " r }
+            if (why == "" && !only(args, ALNUM " +._,=:/-")) why = "args has characters that are not allowed"
+            n = name
+            gsub(/[|]/, "?", n)
+            if (why != "") print "!|" n "|" why
+            else print name "|" replaces "|" exe "|" workdir "|" args
+        }
+        BEGIN {
+            ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            guid = tolower(guid)
+        }
+        { sub(/\r$/, "") } # a file saved on Windows
+        /^[ \t]*[#;]/ || /^[ \t]*$/ { next }
+        /^[ \t]*\[.*\][ \t]*$/ { # [<guid>/<launcher name>] starts a launcher
+            finish()
+            h = trim($0)
+            h = substr(h, 2, length(h) - 2)
+            i = index(h, "/")
+            mine = (i > 0 && tolower(trim(substr(h, 1, i - 1))) == guid)
+            name = mine ? trim(substr(h, i + 1)) : ""
+            replaces = exe = workdir = args = ""
+            next
+        }
+        mine && index($0, "=") {
+            k = trim(substr($0, 1, index($0, "=") - 1))
+            v = trim(substr($0, index($0, "=") + 1))
+            if (k == "replaces") replaces = v
+            else if (k == "exe") exe = v
+            else if (k == "workdir") workdir = v
+            else if (k == "args") args = v
+            # any other key is ignored, so an older script can read a newer file
+            next
+        }
+        END { finish() }
+    ' "$1"
+}
+
+# Looks for fixes for this game in game-fixes.ini, and puts the usable launchers in
+# GAME_FIXES, one "name|replaces|exe|workdir|args" per line (empty when there are none).
+# The file is optional, so failing to get it only means going on without: the install is
+# never stopped by it. Every step is logged. Set ZOOM_GAME_FIXES_FILE to read a local
+# file instead of downloading it.
+load_game_fixes() {
+    GAME_FIXES=''
+    _gf_nl='
+'
+    _gf_file="$CACHE_DIR/game-fixes.ini"
+    if [ -n "${ZOOM_GAME_FIXES_FILE:-}" ]; then
+        _gf_file=$ZOOM_GAME_FIXES_FILE
+        log_info "Game fixes: reading \"$_gf_file\" (from ZOOM_GAME_FIXES_FILE)"
+        if [ ! -r "$_gf_file" ]; then
+            log_warning "Game fixes: can't read \"$_gf_file\", going on without them"
+            return 0
+        fi
+    else
+        log_info "Game fixes: looking for fixes for this game in $GAME_FIXES_URL"
+        rm -f "$_gf_file"
+        curl -fLs --max-time 15 -o "$_gf_file" \
+            -H "User-Agent: zoom-platform.sh/$INSTALLER_VERSION (+https://zoom-platform.sh/)" "$GAME_FIXES_URL"
+        _gf_exit=$?
+        if [ $_gf_exit -ne 0 ]; then
+            rm -f "$_gf_file"
+            log_info "Game fixes: couldn't get the file (curl exit $_gf_exit), going on without them"
+            return 0
+        fi
+        log_info "Game fixes: got the file"
+    fi
+
+    _gf_parsed=$(parse_game_fixes "$_gf_file" "$ZOOM_GUID")
+    _gf_count=0
+    _gf_names=''
+    while IFS='|' read -r _gf_a _gf_b _gf_c _gf_d _gf_e; do
+        [ -n "$_gf_a" ] || continue
+        if [ "$_gf_a" = '!' ]; then
+            log_warning "Game fixes: ignoring \"$_gf_b\": $_gf_c"
+            continue
+        fi
+        GAME_FIXES="$GAME_FIXES$_gf_a|$_gf_b|$_gf_c|$_gf_d|$_gf_e$_gf_nl"
+        _gf_count=$((_gf_count+1))
+        _gf_names="${_gf_names:+$_gf_names, }\"$_gf_a\""
+    done <<EOL
+$_gf_parsed
+EOL
+    if [ $_gf_count -eq 0 ]; then
+        log_info "Game fixes: none for this game"
+    else
+        log_info "Game fixes: $_gf_count launcher(s) for this game: $_gf_names"
+    fi
+}
+
+# Writes a launch script and, unless desktop entries are off, its menu entry.
+# $1: launcher name (its file name)
+# $2: name of the menu entry
+# $3: working directory, and
+# $4: the exe to start: Windows paths with the backslashes doubled, since they're
+#     written between double quotes
+# $5: arguments for the exe (unquoted in the script, so they can be several)
+# $6: icon file, may be empty
+# $7: StartupWMClass
+# $8: the installer's shortcut this launcher is for, to link it on the Desktop
+make_launcher() {
+    _ml_filename=$1
+    _ml_name=$2
+    _ml_workingdir=$3
+    _ml_exe=$4
+    _ml_args=$5
+    _ml_iconpath=$6
+    _ml_wmclass=$7
+    _ml_shortcut=$8
+
+    cat >"$ZOOM_SHORTCUTS_PATH/$_ml_filename.sh" <<EOL
+#!/bin/sh
+export GAMEID="$UMU_ID"
+export WINEPREFIX="$INSTALL_PATH"
+export STORE="zoomplatform"
+$(umu_launch_command) start /b /d "$_ml_workingdir" "$_ml_exe" $_ml_args
+EOL
+    chmod +x "$ZOOM_SHORTCUTS_PATH/$_ml_filename.sh"
+    LAUNCHERS_MADE=$((LAUNCHERS_MADE+1))
+    LAUNCHER_MAP="$LAUNCHER_MAP$_ml_shortcut|$_ml_filename$_nl"
+
+    # Desktop entries do not play well with special characters, and each distro handles them
+    # different enough to be annoyingly problematic.
+    # So we create a script in a location with no special characters (hopefully) that launches umu.
+    if [ "$CREATE_DESKTOP_ENTRIES" -eq 1 ]; then
+        _ml_desktopfile="$ZOOM_SHORTCUTS_PATH/$_ml_filename.desktop"
+        _ml_fsum=$(printf '%s' "$_ml_filename" | cksum | cut -d ' ' -f1)
+
+        # Place script in $XDG_DATA_HOME/zoom-platform/
+        mkdir -p "$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID/"
+        ln -sf "$ZOOM_SHORTCUTS_PATH/$_ml_filename.sh" "$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID/$_ml_fsum.sh"
+
+        # Now create .desktop and point to script
+        cat >"$_ml_desktopfile" <<EOL
+[Desktop Entry]
+Name=$_ml_name
+Exec=$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID/$_ml_fsum.sh
+${_ml_iconpath:+Icon=$_ml_iconpath}
+StartupWMClass=$_ml_wmclass
+Terminal=false
+Type=Application
+Categories=Game
+X-KDE-RunOnDiscreteGpu=true
+EOL
+        log_info "Creating \"$APPLICATIONS_PATH/$_ml_name.desktop\""
+        desktop-file-install --delete-original --dir="$APPLICATIONS_PATH" "$_ml_desktopfile"
+        chmod +x "$APPLICATIONS_PATH/$_ml_name.desktop"
+    fi
+}
+
+# Makes the launchers game-fixes.ini has for an installer shortcut, in its place.
+# Returns 0 if it made any. Returns 1 if the file has none for this shortcut, or none of
+# them could be made (say the game's exe isn't where the file expects it after an update),
+# and then the caller makes the shortcut's own launcher as usual.
+# $1: the shortcut's name
+# $2: its target, as parse_lnk prints it (backslashes doubled), which is where the exe
+#     and working directory in the file start from
+# $3: icon file for the launchers, may be empty
+make_fixed_launchers() {
+    _fx_shortcut=$1
+    _fx_target=$(printf '%s' "$2" | sed 's/\\\\/\\/g') # plain backslashes, for umu
+    _fx_icon=$3
+    _fx_base=${_fx_target%\\*} # the folder of the shortcut's target
+    _fx_matched=0
+    _fx_made=0
+
+    while IFS='|' read -r _fx_name _fx_replaces _fx_exe _fx_workdir _fx_args; do
+        [ -n "$_fx_name" ] || continue
+        [ "$_fx_replaces" = "$_fx_shortcut" ] || continue
+        _fx_matched=$((_fx_matched+1))
+
+        # Don't make a launcher for something that isn't there. The umu call gets
+        # /dev/null so it can't swallow the rest of the fixes.
+        _fx_winexe="$_fx_base\\$_fx_exe"
+        _fx_native=$( (PROTON_VERB=getnativepath umu_launch "$_fx_winexe" < /dev/null) 2> /dev/null | head -n 1)
+        if [ ! -f "$_fx_native" ]; then
+            log_warning "Game fix \"$_fx_name\": \"$_fx_winexe\" isn't there, skipping it"
+            continue
+        fi
+        _fx_winworkdir=$_fx_base
+        [ -n "$_fx_workdir" ] && _fx_winworkdir="$_fx_base\\$_fx_workdir"
+        # What wine calls the game's window, which is what the menu entry has to match
+        _fx_exename=${_fx_exe##*\\}
+        _fx_wmclass=$(printf '%s' "$_fx_exename" | tr '[:upper:]' '[:lower:]')
+
+        log_info "Game fix: making \"$_fx_name\" in place of \"$_fx_shortcut\""
+        make_launcher "$_fx_name" "$_fx_name" \
+            "$(printf '%s' "$_fx_winworkdir" | sed 's/\\/\\\\/g')" \
+            "$(printf '%s' "$_fx_winexe" | sed 's/\\/\\\\/g')" \
+            "$_fx_args" "$_fx_icon" "$_fx_wmclass" "$_fx_shortcut"
+        _fx_made=$((_fx_made+1))
+    done <<EOL
+$GAME_FIXES
+EOL
+
+    if [ $_fx_made -gt 0 ]; then
+        return 0
+    fi
+    if [ $_fx_matched -gt 0 ]; then
+        log_warning "Game fixes: none of the launchers for \"$_fx_shortcut\" could be made, keeping its own"
+    fi
+    return 1
+}
+
 show_usage() {
     printf 'Usage: zoom-platform.sh [OPTIONS] INSTALLER DEST
 
@@ -1325,6 +1573,7 @@ GAME_NAME_SAFE=$(get_header_val 'default_group_name')
 PROTON_SHORTCUTS_PATH="$INSTALL_PATH/drive_c/proton_shortcuts"
 APPLICATIONS_PATH="$APPLICATIONS_ROOT/$GAME_NAME_SAFE"
 ZOOM_SHORTCUTS_PATH="$INSTALL_PATH/drive_c/zoom_shortcuts"
+load_game_fixes # optional, sets GAME_FIXES
 log_info "Creating desktop entries..."
 mkdir -p "$ZOOM_SHORTCUTS_PATH"
 ensure_proton_shortcuts # waits for wine to create the shortcuts and fills in any it missed
@@ -1395,44 +1644,10 @@ for file in "$PROTON_SHORTCUTS_PATH"/*.desktop; do
         [ -n "$_iconfile" ] && _iconpath="$PROTON_SHORTCUTS_PATH/icons/$_iconfile"
     fi
 
-    cat >"$ZOOM_SHORTCUTS_PATH/$_filename.sh" <<EOL
-#!/bin/sh
-export GAMEID="$UMU_ID"
-export WINEPREFIX="$INSTALL_PATH"
-export STORE="zoomplatform"
-$(umu_launch_command) start /b /d "$_lnk_workingdir" "$_lnk_exe" $_lnk_args
-EOL
-    chmod +x "$ZOOM_SHORTCUTS_PATH/$_filename.sh"
-    LAUNCHERS_MADE=$((LAUNCHERS_MADE+1))
-    LAUNCHER_MAP="$LAUNCHER_MAP$_shortcut_name|$_filename$_nl"
+    # A game fix (game-fixes.ini) can replace this shortcut with launchers of its own
+    make_fixed_launchers "$_shortcut_name" "$_lnk_exe" "$_iconpath" && continue
 
-    # Desktop entries do not play well with special characters, and each distro handles them
-    # different enough to be annoyingly problematic.
-    # So we create a script in a location with no special characters (hopefully) that launches umu.
-    if [ $CREATE_DESKTOP_ENTRIES -eq 1 ]; then
-        _zoomdesktopfile="$ZOOM_SHORTCUTS_PATH/$_filename.desktop"
-        _fsum=$(printf '%s' "$_filename" | cksum | cut -d ' ' -f1)
-
-        # Place script in $XDG_DATA_HOME/zoom-platform/
-        mkdir -p "$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID/"
-        ln -sf "$ZOOM_SHORTCUTS_PATH/$_filename.sh" "$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID/$_fsum.sh"
-
-        # Now create .desktop and point to script
-        cat >"$_zoomdesktopfile" <<EOL
-[Desktop Entry]
-Name=$_name
-Exec=$LAUNCH_SCRIPTS_PATH/$ZOOM_GUID/$_fsum.sh
-${_iconpath:+Icon=$_iconpath}
-StartupWMClass=$_wmclass
-Terminal=false
-Type=Application
-Categories=Game
-X-KDE-RunOnDiscreteGpu=true
-EOL
-        log_info "Creating \"$APPLICATIONS_PATH/$_name.desktop\""
-        desktop-file-install --delete-original --dir="$APPLICATIONS_PATH" "$_zoomdesktopfile"
-        chmod +x "$APPLICATIONS_PATH/$_name.desktop"
-    fi
+    make_launcher "$_filename" "$_name" "$_lnk_workingdir" "$_lnk_exe" "$_lnk_args" "$_iconpath" "$_wmclass" "$_shortcut_name"
 done
 
 # The install can look successful while having no launcher at all, so say so
