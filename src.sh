@@ -11,9 +11,10 @@ INNOEXTRACT_BINARY_B64=0
 
 INSTALLER_VERSION="DEV"
 REPO_PATH="https://github.com/DarthSidiousPT/zoom-platform.sh"
-# Optional per-game fixes (see game-fixes.ini), read while installing. Kept in a file
-# of its own so a game's quirk doesn't need a change to this script.
-GAME_FIXES_URL="https://raw.githubusercontent.com/DarthSidiousPT/zoom-platform.sh/main/game-fixes.ini"
+# Optional per-game fixes, read while installing: game-fixes/<ZOOM game GUID>.ini in this
+# repository (see game-fixes/README.md). Kept in files of their own so a game's quirk
+# doesn't need a change to this script, and only the installed game's file is downloaded.
+GAME_FIXES_URL="https://raw.githubusercontent.com/DarthSidiousPT/zoom-platform.sh/main/game-fixes"
 INNOEXT_BIN="/tmp/innoextract_zoom"
 LAUNCH_SCRIPTS_PATH="$HOME"/.local/share/zoom-platform
 APPLICATIONS_ROOT="$HOME"/.local/share/applications/zoom-platform
@@ -961,16 +962,15 @@ $_sc_missing
 EOL
 }
 
-# Reads a file in the game-fixes.ini format and prints one line for each launcher that
-# belongs to the game $2:  name|replaces|exe|workdir|args
+# Reads a game's file in the game-fixes format and prints one line for each launcher in it:
+#   name|replaces|exe|workdir|args
 # A launcher that can't be used comes out as  !|name|reason  instead, for the caller to
 # warn about. The file comes off the network and its values end up inside a generated
 # shell script (args unquoted), so every value is checked here against a short list of
 # allowed characters, and none can hold the "|" that separates the fields above.
 # $1: the file
-# $2: ZOOM game GUID
 parse_game_fixes() {
-    awk -v guid="$2" '
+    awk '
         function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
         # Does s hold any of the characters in set?
         function has_any(s, set,    i) {
@@ -994,9 +994,9 @@ parse_game_fixes() {
             if (q ~ /^\// || q ~ /\/$/ || q ~ /\/\// || q ~ /(^|\/)[.][.](\/|$)/) return "is not a plain relative path"
             return ""
         }
-        # Prints the launcher collected so far, if it belongs to this game
+        # Prints the launcher collected so far, if there is one
         function finish(    why, r, n) {
-            if (!mine) return
+            if (!open) return
             why = ""
             if (bad_name(name)) why = "the launcher name is empty or has characters that are not allowed"
             if (why == "" && bad_name(replaces)) why = "replaces is missing or has characters that are not allowed"
@@ -1011,21 +1011,18 @@ parse_game_fixes() {
         }
         BEGIN {
             ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            guid = tolower(guid)
         }
         { sub(/\r$/, "") } # a file saved on Windows
         /^[ \t]*[#;]/ || /^[ \t]*$/ { next }
-        /^[ \t]*\[.*\][ \t]*$/ { # [<guid>/<launcher name>] starts a launcher
+        /^[ \t]*\[.*\][ \t]*$/ { # [launcher name] starts a launcher
             finish()
             h = trim($0)
-            h = substr(h, 2, length(h) - 2)
-            i = index(h, "/")
-            mine = (i > 0 && tolower(trim(substr(h, 1, i - 1))) == guid)
-            name = mine ? trim(substr(h, i + 1)) : ""
+            name = trim(substr(h, 2, length(h) - 2))
+            open = 1
             replaces = exe = workdir = args = ""
             next
         }
-        mine && index($0, "=") {
+        open && index($0, "=") {
             k = trim(substr($0, 1, index($0, "=") - 1))
             v = trim(substr($0, index($0, "=") + 1))
             if (k == "replaces") replaces = v
@@ -1039,11 +1036,11 @@ parse_game_fixes() {
     ' "$1"
 }
 
-# Looks for fixes for this game in game-fixes.ini, and puts the usable launchers in
-# GAME_FIXES, one "name|replaces|exe|workdir|args" per line (empty when there are none).
-# The file is optional, so failing to get it only means going on without: the install is
-# never stopped by it. Every step is logged. Set ZOOM_GAME_FIXES_FILE to read a local
-# file instead of downloading it.
+# Looks for this game's file in game-fixes/ (named after its GUID), and puts the usable
+# launchers in GAME_FIXES, one "name|replaces|exe|workdir|args" per line (empty when there
+# are none). The file is optional, and most games have none, so not getting it only means
+# going on without: the install is never stopped by it. Every step is logged. Set
+# ZOOM_GAME_FIXES_FILE to read a local file instead of downloading it.
 load_game_fixes() {
     GAME_FIXES=''
     _gf_nl='
@@ -1057,20 +1054,34 @@ load_game_fixes() {
             return 0
         fi
     else
-        log_info "Game fixes: looking for fixes for this game in $GAME_FIXES_URL"
+        # The file is named after the game's GUID, in lowercase (raw.githubusercontent.com
+        # is case sensitive)
+        _gf_url="$GAME_FIXES_URL/$(printf '%s' "$ZOOM_GUID" | tr '[:upper:]' '[:lower:]').ini"
+        log_info "Game fixes: looking for a fixes file for this game at $_gf_url"
         rm -f "$_gf_file"
-        curl -fLs --max-time 15 -o "$_gf_file" \
-            -H "User-Agent: zoom-platform.sh/$INSTALLER_VERSION (+https://zoom-platform.sh/)" "$GAME_FIXES_URL"
+        # No -f, so the status code can tell "no file for this game", which is what
+        # nearly every game gets (a 404), from a real failure like being offline
+        _gf_code=$(curl -Ls --max-time 15 -o "$_gf_file" -w '%{http_code}' \
+            -H "User-Agent: zoom-platform.sh/$INSTALLER_VERSION (+https://zoom-platform.sh/)" "$_gf_url")
         _gf_exit=$?
-        if [ $_gf_exit -ne 0 ]; then
-            rm -f "$_gf_file"
-            log_info "Game fixes: couldn't get the file (curl exit $_gf_exit), going on without them"
-            return 0
-        fi
-        log_info "Game fixes: got the file"
+        case "$_gf_exit:$_gf_code" in
+            0:200)
+                log_info "Game fixes: got the file"
+                ;;
+            0:404)
+                rm -f "$_gf_file"
+                log_info "Game fixes: none for this game"
+                return 0
+                ;;
+            *)
+                rm -f "$_gf_file"
+                log_info "Game fixes: couldn't get the file (curl exit $_gf_exit, HTTP $_gf_code), going on without them"
+                return 0
+                ;;
+        esac
     fi
 
-    _gf_parsed=$(parse_game_fixes "$_gf_file" "$ZOOM_GUID")
+    _gf_parsed=$(parse_game_fixes "$_gf_file")
     _gf_count=0
     _gf_names=''
     while IFS='|' read -r _gf_a _gf_b _gf_c _gf_d _gf_e; do
@@ -1086,7 +1097,7 @@ load_game_fixes() {
 $_gf_parsed
 EOL
     if [ $_gf_count -eq 0 ]; then
-        log_info "Game fixes: none for this game"
+        log_info "Game fixes: no usable launcher in the file"
     else
         log_info "Game fixes: $_gf_count launcher(s) for this game: $_gf_names"
     fi
@@ -1152,7 +1163,7 @@ EOL
     fi
 }
 
-# Makes the launchers game-fixes.ini has for an installer shortcut, in its place.
+# Makes the launchers the game's fixes file has for an installer shortcut, in its place.
 # Returns 0 if it made any. Returns 1 if the file has none for this shortcut, or none of
 # them could be made (say the game's exe isn't where the file expects it after an update),
 # and then the caller makes the shortcut's own launcher as usual.
@@ -1644,7 +1655,7 @@ for file in "$PROTON_SHORTCUTS_PATH"/*.desktop; do
         [ -n "$_iconfile" ] && _iconpath="$PROTON_SHORTCUTS_PATH/icons/$_iconfile"
     fi
 
-    # A game fix (game-fixes.ini) can replace this shortcut with launchers of its own
+    # A game fix (game-fixes/) can replace this shortcut with launchers of its own
     make_fixed_launchers "$_shortcut_name" "$_lnk_exe" "$_iconpath" && continue
 
     make_launcher "$_filename" "$_name" "$_lnk_workingdir" "$_lnk_exe" "$_lnk_args" "$_iconpath" "$_wmclass" "$_shortcut_name"
